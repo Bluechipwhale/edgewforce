@@ -5,6 +5,7 @@
 
 import bcrypt from 'bcryptjs';
 import { db, supabase } from '../config/database.js';
+import { userRef } from '../utils/id.js';
 import { supabaseAuthService } from './supabaseAuthService.js';
 import { signUserToken } from '../middleware/auth.js';
 import { recordAudit } from '../middleware/auditLogger.js';
@@ -114,7 +115,7 @@ export const authService = {
           authUser = sbRes.data.user;
 
           if (authUser && user.auth_user_id !== authUser.id) {
-            await db.update('users', user.id, { auth_user_id: authUser.id, uuid: authUser.id });
+            await db.update('users', user.id, { auth_user_id: authUser.id });
           }
         } else if (sbRes?.error) {
           // Check if local bcrypt password matches (e.g. initial seed account / offline record)
@@ -129,7 +130,7 @@ export const authService = {
                 roleCode: user.role_code
               });
               if (provisionRes?.authUserId) {
-                await db.update('users', user.id, { auth_user_id: provisionRes.authUserId, uuid: provisionRes.authUserId });
+                await db.update('users', user.id, { auth_user_id: provisionRes.authUserId });
                 // Re-attempt sign-in with the freshly synced Supabase user
                 const retryLogin = await supabaseAuthService.signIn({ email: user.email, password });
                 if (retryLogin?.data?.session) {
@@ -171,7 +172,8 @@ export const authService = {
     db.update('users', user.id, { last_login_at: new Date().toISOString() }).catch(() => {});
     recordAudit(user, 'LOGIN', 'users', user.id, { email: user.email, phone: user.phone }, req).catch(() => {});
 
-    const employee = await db.findOne('employees', { user_id: user.id }) ||
+    const employee = await db.findOne('employees', { user_id: userRef(user) }) ||
+                     (userRef(user) !== user.id ? await db.findOne('employees', { user_id: user.id }) : null) ||
                      (user.auth_user_id ? await db.findOne('employees', { auth_user_id: user.auth_user_id }) : null);
 
     const [rank, department] = await Promise.all([
@@ -212,7 +214,8 @@ export const authService = {
 
     if (!user) throw new Error('User not found');
 
-    const employee = await db.findOne('employees', { user_id: user.id }) ||
+    const employee = await db.findOne('employees', { user_id: userRef(user) }) ||
+                     (userRef(user) !== user.id ? await db.findOne('employees', { user_id: user.id }) : null) ||
                      (user.auth_user_id ? await db.findOne('employees', { auth_user_id: user.auth_user_id }) : null);
 
     const [rank, department] = await Promise.all([
@@ -348,7 +351,7 @@ export const authService = {
     const lastName = rest.join(' ') || firstName;
 
     const employee = await db.insert('employees', {
-      user_id: user.id,
+      user_id: userRef(user),
       auth_user_id: authUserId,
       employee_code: empCode,
       first_name: firstName,

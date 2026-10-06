@@ -61,10 +61,11 @@ export default function EmployeeLocationAssignModal({
   const loadData = async () => {
     if (!employee?.id) return;
     setLoading(true);
+    setErrorMsg('');
     try {
       const [locsRes, empLocsRes] = await Promise.all([
-        apiRequest('/locations?status=active').catch(() => ({ data: [] })),
-        apiRequest(`/locations/employee/${employee.id}`).catch(() => ({ data: null }))
+        apiRequest('/locations?status=active'),
+        apiRequest(`/locations/employee/${encodeURIComponent(employee.id)}`)
       ]);
 
       const locList = Array.isArray(locsRes) ? locsRes : (locsRes.data || locsRes.locations || []);
@@ -83,7 +84,7 @@ export default function EmployeeLocationAssignModal({
         }
       }
     } catch (err) {
-      console.warn('Failed to load employee location data:', err);
+      setErrorMsg(err.message || 'Failed to load work locations. Please retry.');
     } finally {
       setLoading(false);
     }
@@ -113,7 +114,7 @@ export default function EmployeeLocationAssignModal({
 
     try {
       const payload = {
-        location_id: Number(selectedLocationId),
+        location_id: selectedLocationId,
         assignment_type: assignmentType,
         is_primary: assignmentType === 'primary',
         start_date: assignmentType === 'temporary' ? startDate : null,
@@ -121,7 +122,7 @@ export default function EmployeeLocationAssignModal({
         reason: reason.trim() || `Assigned ${assignmentType} location`
       };
 
-      const res = await apiRequest(`/locations/employee/${employee.id}/assign`, 'POST', payload);
+      await apiRequest(`/locations/employee/${encodeURIComponent(employee.id)}/assign`, 'POST', payload);
       setSuccessMsg(`✓ Location successfully assigned to ${employee.first_name || employee.name}!`);
       loadData();
       onAssignmentComplete?.();

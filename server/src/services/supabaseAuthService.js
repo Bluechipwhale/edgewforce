@@ -3,7 +3,7 @@
 // Authoritative Identity Provisioning, Authentication, and Password Lifecycle
 // ==============================================================================
 
-import { supabase, supabaseAdmin } from '../config/database.js';
+import { supabase, supabaseAdmin, createSupabaseAuthClient } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 
 const isTestMode = process.env.NODE_ENV === 'test' || Boolean(process.env.TEST_MODE);
@@ -40,7 +40,7 @@ export const supabaseAuthService = {
         if (error && (error.message?.includes('already registered') || error.code === 'email_exists')) {
           // Attempt to retrieve existing user ID via signIn or list
           try {
-            const loginRes = await supabase.auth.signInWithPassword({ email: cleanEmail, password: passwordToUse });
+            const loginRes = await createSupabaseAuthClient().auth.signInWithPassword({ email: cleanEmail, password: passwordToUse });
             if (loginRes.data?.user) {
               return { authUserId: loginRes.data.user.id, user: loginRes.data.user };
             }
@@ -58,7 +58,7 @@ export const supabaseAuthService = {
     // Pathway B: Standard Client API (Anon / Publishable Key)
     if (supabase?.auth && typeof supabase.auth.signUp === 'function') {
       try {
-        const { data, error } = await supabase.auth.signUp({
+        const { data, error } = await createSupabaseAuthClient().auth.signUp({
           email: cleanEmail,
           password: passwordToUse,
           options: {
@@ -76,7 +76,7 @@ export const supabaseAuthService = {
 
         if (error && (error.message?.includes('already registered') || error.code === 'user_already_exists')) {
           try {
-            const loginRes = await supabase.auth.signInWithPassword({ email: cleanEmail, password: passwordToUse });
+            const loginRes = await createSupabaseAuthClient().auth.signInWithPassword({ email: cleanEmail, password: passwordToUse });
             if (loginRes.data?.user) {
               return { authUserId: loginRes.data.user.id, user: loginRes.data.user, session: loginRes.data.session };
             }
@@ -101,7 +101,7 @@ export const supabaseAuthService = {
     if (isTestMode || !supabase?.auth || !email || !password) return null;
     try {
       const cleanEmail = email.toLowerCase().trim();
-      const res = await supabase.auth.signInWithPassword({
+      const res = await createSupabaseAuthClient().auth.signInWithPassword({
         email: cleanEmail,
         password
       });

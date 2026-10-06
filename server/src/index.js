@@ -36,6 +36,7 @@ import { employeeService } from './services/employeeService.js';
 import { reminderWorker } from './services/reminderWorker.js';
 import { staffImportService } from './services/staffImportService.js';
 import { logger } from './utils/logger.js';
+import { db, supabase } from './config/database.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT);
@@ -95,13 +96,26 @@ const generalLimiter = rateLimit({
 app.use('/api', generalLimiter);
 
 // 4. Health Check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    service: 'EDGEWFORCE Enterprise Backend',
-    version: '1.0.0',
-    timestamp: new Date().toISOString()
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    if (supabase) {
+      await db.find('attendance', {}, {
+        select: 'location_id,morning_clock_in,midday_clock_in,evening_clock_out', limit: 1, strict: true
+      });
+    }
+    res.json({
+      status: 'healthy',
+      service: 'EDGEWFORCE Enterprise Backend',
+      version: '1.0.0',
+      database: supabase ? 'supabase' : 'local',
+      workplace_schema_version: supabase ? 17 : null,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Workplace database health check failed', error);
+    res.status(503).json({status:'unavailable', service:'EDGEWFORCE Enterprise Backend',
+      error:{code:'WORKPLACE_DATABASE_UNAVAILABLE',message:'The workplace database is unavailable or requires migration 017.'}});
+  }
 });
 
 // 5. Mount API Routes
