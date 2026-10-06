@@ -7,9 +7,16 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import tls from 'node:tls';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import { logger } from '../utils/logger.js';
+import { isTestMode } from '../utils/runtime.js';
+import { isUuid } from '../utils/id.js';
+import { retryLegacyRuntimeActorWrite } from './runtimeActorCompat.js';
+import { createSupabaseClients } from './supabaseClients.js';
+import { resolveSchemaVariant } from './schemaVariant.js';
+import { attendanceWrite } from './attendanceSchema.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT);
@@ -24,29 +31,39 @@ try {
 
 export let supabase = null;
 export let supabaseAdmin = null;
+export let createSupabaseAuthClient = null;
 
-const isTestMode = process.env.NODE_ENV === 'test' || Boolean(process.env.TEST_MODE) || process.execArgv.includes('--test') || process.argv.some(a => a.includes('test'));
+const isProduction = (isServerless || process.env.NODE_ENV === 'production' || process.env.DATABASE_MODE === 'supabase') && !isTestMode;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const databaseKey = serviceRoleKey || anonKey;
+const usesNumberedSchema = resolveSchemaVariant(process.env.SUPABASE_SCHEMA_VARIANT) === 'numbered';
+
+if (isProduction && (!supabaseUrl || !serviceRoleKey)) {
+  throw new Error('Live database mode requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY. Local database fallback is disabled.');
+}
+
+if (process.env.SUPABASE_USE_SYSTEM_CA === 'true') {
+  if (typeof tls.setDefaultCACertificates !== 'function') {
+    throw new Error('SUPABASE_USE_SYSTEM_CA requires Node 22.19+ or Node 24+.');
+  }
+  tls.setDefaultCACertificates([...tls.getCACertificates('default'), ...tls.getCACertificates('system')]);
+}
 
 // Dynamically initialize Supabase if credentials are provided and not in test runner
-if (!isTestMode && supabaseUrl && (serviceRoleKey || anonKey)) {
+if (!isTestMode && supabaseUrl && databaseKey) {
   try {
-    const { createClient } = await import('@supabase/supabase-js');
-    if (anonKey || serviceRoleKey) {
-      supabase = createClient(supabaseUrl, anonKey || serviceRoleKey, {
-        auth: { persistSession: false, autoRefreshToken: false }
-      });
-    }
-    if (serviceRoleKey) {
-      supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
-        auth: { persistSession: false, autoRefreshToken: false }
-      });
+    const clients = createSupabaseClients({ url: supabaseUrl, publicKey: anonKey, serviceKey: serviceRoleKey });
+    supabase = clients.database;
+    supabaseAdmin = clients.admin;
+    createSupabaseAuthClient = clients.createAuthClient;
+    if (supabaseAdmin) {
       logger.info('Supabase Admin Client initialized with Service Role.');
     }
-    logger.info('Connected to Supabase database.');
+    logger.info('Supabase client configured. Database availability is checked by /api/health.');
   } catch (err) {
+    if (isProduction) throw new Error(`Unable to initialize the production Supabase client: ${err.message}`);
     logger.warn(`Supabase connection failed: ${err.message}. Operating in local transactional mode.`);
   }
 } else {
@@ -217,6 +234,7 @@ const initialSeed = {
   payslips: [],
   okrs: [],
   tasks: [],
+  task_comments: [],
   task_reminders: [],
   task_reminder_rules: [],
   reminder_delivery_logs: [],
@@ -382,6 +400,7 @@ const initialSeed = {
 let store = JSON.parse(JSON.stringify(initialSeed));
 
 function loadPersistedStore() {
+  if (isTestMode) return;
   try {
     if (fs.existsSync(storePath)) {
       const data = fs.readFileSync(storePath, 'utf8');
@@ -407,6 +426,7 @@ function loadPersistedStore() {
 }
 
 function savePersistedStoreSync() {
+  if (isProduction || isTestMode) return;
   try {
     fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
   } catch (err) {
@@ -415,6 +435,7 @@ function savePersistedStoreSync() {
 }
 
 function savePersistedStore() {
+  if (isProduction || isTestMode) return;
   try {
     fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
   } catch (err) {
@@ -422,10 +443,10 @@ function savePersistedStore() {
   }
 }
 
-loadPersistedStore();
+if (!isProduction) loadPersistedStore();
 
-// Helper to race promise against a timeout
-function fetchWithTimeout(promise, ms = 450) {
+// Helper to race promise against a timeout (generous 8s for cloud/serverless latency)
+function fetchWithTimeout(promise, ms = 8000) {
   let timeoutId;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error('SUPABASE_TIMEOUT')), ms);
@@ -435,6 +456,7 @@ function fetchWithTimeout(promise, ms = 450) {
 
 // Canonical Table Name Mapper
 function resolveCanonicalTable(table) {
+  if (usesNumberedSchema) return table;
   const map = {
     visits: 'field_visits',
     orders: 'sales',
@@ -446,6 +468,7 @@ function resolveCanonicalTable(table) {
 
 export const db = {
   resetToSeed() {
+    if (isProduction) throw new Error('The local seed store is disabled in production.');
     store = JSON.parse(JSON.stringify(initialSeed));
     savePersistedStore();
     return true;
@@ -453,6 +476,9 @@ export const db = {
 
   async find(table, filter = {}, options = {}) {
     const canonicalTable = resolveCanonicalTable(table);
+    if (!isTestMode && usesNumberedSchema && table === 'employees' && filter.user_id != null && !isUuid(String(filter.user_id))) {
+      return [];
+    }
 
     if (supabase && !isTestMode) {
       try {
@@ -460,15 +486,16 @@ export const db = {
         for (const [k, v] of Object.entries(filter)) {
           if (v !== undefined && v !== null) {
             // Alias resolution for attendance filters
-            const mappedKey = (canonicalTable === 'attendance' && k === 'date') ? 'attendance_date' : k;
+            const mappedKey = (!usesNumberedSchema && canonicalTable === 'attendance' && k === 'date') ? 'attendance_date' : k;
             q = q.eq(mappedKey, v);
           }
         }
         if (options.order) q = q.order(options.order.column, { ascending: options.order.ascending !== false });
-        if (options.limit) q = q.limit(options.limit);
+        if (options.offset !== undefined) q = q.range(options.offset, options.offset + (options.limit || 500) - 1);
+        else if (options.limit) q = q.limit(options.limit);
         
-        const { data, error } = await fetchWithTimeout(q, 450);
-        if (!error && data && data.length > 0) {
+        const { data, error } = await fetchWithTimeout(q, 8000);
+        if (!error && Array.isArray(data)) {
           return data.map(item => {
             // Normalize attendance fields for backwards compatibility
             if (canonicalTable === 'attendance') {
@@ -486,11 +513,20 @@ export const db = {
             return item;
           });
         }
+        if (isProduction) throw new Error(`Supabase query for ${canonicalTable} failed: ${error?.message || 'empty response'}`);
+        if (options.strict) throw new Error(`Unable to load ${canonicalTable} from the database.`);
+        if (error && (error.code === '42P01' || error.message?.includes('does not exist') || error.message?.includes('schema cache'))) {
+          logger.warn(`Supabase table ${canonicalTable} not found in database, using local fallback.`);
+        } else if (error) {
+          logger.error(`Supabase query for ${canonicalTable} failed: ${error.message}`);
+        }
       } catch (err) {
-        // Fast instant fallback to local store without blocking
+        if (isProduction || options.strict) throw err;
+        logger.warn(`Supabase find for ${canonicalTable} notice: ${err.message}`);
       }
     }
 
+    if (isProduction) throw new Error('Supabase is unavailable. Production database fallback is disabled.');
     const targetList = store[canonicalTable] || store[table] || [];
     let items = targetList.filter(item => {
       return Object.entries(filter).every(([k, v]) => {
@@ -513,6 +549,10 @@ export const db = {
       });
     }
 
+    if (options.offset) items = items.slice(options.offset);
+    if (options.strict && !Object.hasOwn(store, canonicalTable) && !Object.hasOwn(store, table)) {
+      throw new Error(`Table ${canonicalTable} is unavailable in the local store.`);
+    }
     if (options.limit) {
       items = items.slice(0, options.limit);
     }
@@ -526,6 +566,10 @@ export const db = {
   },
 
   async findById(table, id) {
+    if (!isTestMode && usesNumberedSchema && ['users', 'employees'].includes(table)) {
+      if (isUuid(String(id))) return this.findOne(table, { uuid: id });
+      if (!/^\d+$/.test(String(id))) return null;
+    }
     return this.findOne(table, { id });
   },
 
@@ -533,33 +577,41 @@ export const db = {
     const canonicalTable = resolveCanonicalTable(table);
 
     // Normalize canonical attendance columns
-    const normalized = { ...record };
-    if (canonicalTable === 'attendance') {
-      if (normalized.date && !normalized.attendance_date) normalized.attendance_date = normalized.date;
-      if (normalized.clock_in_time && !normalized.clock_in) normalized.clock_in = normalized.clock_in_time;
-      if (normalized.clock_out_time && !normalized.clock_out) normalized.clock_out = normalized.clock_out_time;
-      if (normalized.clock_in_lat && !normalized.clock_in_latitude) normalized.clock_in_latitude = normalized.clock_in_lat;
-      if (normalized.clock_in_lng && !normalized.clock_in_longitude) normalized.clock_in_longitude = normalized.clock_in_lng;
-      if (normalized.clock_out_lat && !normalized.clock_out_latitude) normalized.clock_out_latitude = normalized.clock_out_lat;
-      if (normalized.clock_out_lng && !normalized.clock_out_longitude) normalized.clock_out_longitude = normalized.clock_out_lng;
-    }
+    const normalized = canonicalTable === 'attendance' && !isTestMode
+      ? attendanceWrite(record, usesNumberedSchema ? 'numbered' : 'legacy')
+      : { ...record };
 
-    let supabaseRecord = null;
     if (supabase && !isTestMode) {
       try {
-        const { data, error } = await supabase.from(canonicalTable).insert(normalized).select().single();
-        if (!error && data) supabaseRecord = data;
+        let { data, error } = await supabase.from(canonicalTable).insert(normalized).select().single();
+        if (error && usesNumberedSchema) {
+          const retried = await retryLegacyRuntimeActorWrite(canonicalTable, normalized, error, supabase,
+            legacy => supabase.from(canonicalTable).insert(legacy).select().single());
+          if (retried) ({ data, error } = retried);
+        }
+        if (error) {
+          logger.error(`Supabase insert for ${canonicalTable} failed: ${error.message}`);
+          throw error;
+        }
+        if (data) {
+          return JSON.parse(JSON.stringify(data));
+        }
       } catch (err) {
-        logger.warn(`Supabase insert for ${canonicalTable} failed, using local store: ${err.message}`);
+        if (isProduction) throw err;
+        if (err.code !== '42P01' && !err.message?.includes('does not exist') && !err.message?.includes('schema cache')) {
+          throw err;
+        }
+        logger.warn(`Supabase table ${canonicalTable} not present, writing to local store: ${err.message}`);
       }
     }
+
+    if (isProduction) throw new Error(`Supabase insert for ${canonicalTable} returned no record.`);
 
     if (!store[canonicalTable]) store[canonicalTable] = [];
     const maxId = store[canonicalTable].reduce((max, r) => Math.max(max, Number(r.id) || 0), 0);
     const newRecord = {
-      ...(supabaseRecord || {}),
-      id: supabaseRecord?.id || record.id || maxId + 1,
-      created_at: supabaseRecord?.created_at || new Date().toISOString(),
+      id: record.id || (typeof record.id === 'string' ? record.id : maxId + 1),
+      created_at: new Date().toISOString(),
       ...normalized
     };
 
@@ -572,24 +624,30 @@ export const db = {
     const canonicalTable = resolveCanonicalTable(table);
 
     // Normalize canonical attendance columns
-    const normalized = { ...updates };
-    if (canonicalTable === 'attendance') {
-      if (normalized.date && !normalized.attendance_date) normalized.attendance_date = normalized.date;
-      if (normalized.clock_in_time && !normalized.clock_in) normalized.clock_in = normalized.clock_in_time;
-      if (normalized.clock_out_time && !normalized.clock_out) normalized.clock_out = normalized.clock_out_time;
-      if (normalized.clock_in_lat && !normalized.clock_in_latitude) normalized.clock_in_latitude = normalized.clock_in_lat;
-      if (normalized.clock_in_lng && !normalized.clock_in_longitude) normalized.clock_in_longitude = normalized.clock_in_lng;
-      if (normalized.clock_out_lat && !normalized.clock_out_latitude) normalized.clock_out_latitude = normalized.clock_out_lat;
-      if (normalized.clock_out_lng && !normalized.clock_out_longitude) normalized.clock_out_longitude = normalized.clock_out_lng;
-    }
+    const normalized = canonicalTable === 'attendance' && !isTestMode
+      ? attendanceWrite(updates, usesNumberedSchema ? 'numbered' : 'legacy')
+      : { ...updates };
 
-    let supabaseRecord = null;
     if (supabase && !isTestMode) {
       try {
-        const { data, error } = await supabase.from(canonicalTable).update(normalized).eq('id', id).select().single();
-        if (!error && data) supabaseRecord = data;
+        let { data, error } = await supabase.from(canonicalTable).update(normalized).eq('id', id).select().single();
+        if (error && usesNumberedSchema) {
+          const retried = await retryLegacyRuntimeActorWrite(canonicalTable, normalized, error, supabase,
+            legacy => supabase.from(canonicalTable).update(legacy).eq('id', id).select().single());
+          if (retried) ({ data, error } = retried);
+        }
+        if (error) {
+          logger.error(`Supabase update for ${canonicalTable} failed: ${error.message}`);
+          throw error;
+        }
+        if (data) return JSON.parse(JSON.stringify(data));
+        return null;
       } catch (err) {
-        logger.warn(`Supabase update for ${canonicalTable} failed: ${err.message}`);
+        if (isProduction) throw err;
+        if (err.code !== '42P01' && !err.message?.includes('does not exist') && !err.message?.includes('schema cache')) {
+          throw err;
+        }
+        logger.warn(`Supabase update for ${canonicalTable} failed, updating local store: ${err.message}`);
       }
     }
 
@@ -606,22 +664,25 @@ export const db = {
       return JSON.parse(JSON.stringify(store[targetTable][index]));
     }
 
-    if (supabaseRecord) {
-      store[targetTable].push(supabaseRecord);
-      savePersistedStore();
-      return supabaseRecord;
-    }
-
     return null;
   },
 
   async delete(table, id) {
     const canonicalTable = resolveCanonicalTable(table);
 
-    if (supabase) {
+    if (supabase && !isTestMode) {
       try {
-        await supabase.from(canonicalTable).delete().eq('id', id);
+        const { error } = await supabase.from(canonicalTable).delete().eq('id', id);
+        if (error) {
+          logger.error(`Supabase delete for ${canonicalTable} failed: ${error.message}`);
+          throw error;
+        }
+        return true;
       } catch (err) {
+        if (isProduction) throw err;
+        if (err.code !== '42P01' && !err.message?.includes('does not exist') && !err.message?.includes('schema cache')) {
+          throw err;
+        }
         logger.warn(`Supabase delete for ${canonicalTable} failed: ${err.message}`);
       }
     }

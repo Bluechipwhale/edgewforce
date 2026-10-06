@@ -10,14 +10,17 @@ import { formatTime } from '../utils/calculations.js';
 import { recordAudit } from '../middleware/auditLogger.js';
 import { locationService } from './locationService.js';
 import { storageService } from './storageService.js';
+import { employeeRef, findEmployeeByAnyId, sameId, toDbId } from '../utils/id.js';
 
+const matchesEmployee = (employee, id) =>
+  sameId(employeeRef(employee), id) || sameId(employee?.id, id) || sameId(employee?.user_id, id);
 
 export const fieldService = {
   /**
    * Retrieves today's assigned route stops / stores with geofence metrics.
    */
   async getRouteManifest(agentId) {
-    const visits = await db.find('visits', { agent_id: Number(agentId) });
+    const visits = await db.find('visits', { agent_id: toDbId(agentId) });
     const customers = await db.find('customers');
     const stores = await db.find('stores');
     const workLocations = await db.find('work_locations');
@@ -40,7 +43,7 @@ export const fieldService = {
    */
   async getCurrentShift(agentId) {
     const todayStr = new Date().toISOString().slice(0, 10);
-    const shift = await db.findOne('attendance', { employee_id: Number(agentId), date: todayStr });
+    const shift = await db.findOne('attendance', { employee_id: toDbId(agentId), date: todayStr });
     if (!shift) return null;
 
     let store = null;
@@ -72,10 +75,10 @@ export const fieldService = {
     let currentAssignedLocations = [];
 
     if (agentId) {
-      employee = await db.findById('employees', agentId);
+      employee = await findEmployeeByAnyId(db, agentId);
       if (employee) {
         isShiftEligible = isShiftEligibleRole(employee.role_code, employee.position);
-        todayAttendance = await db.findOne('attendance', { employee_id: Number(agentId), date: lagosTime.dateStr });
+        todayAttendance = await db.findOne('attendance', { employee_id: toDbId(agentId), date: lagosTime.dateStr });
         if (todayAttendance) {
           morningRecorded = Boolean(todayAttendance.morning_clock_in);
           middayRecorded = Boolean(todayAttendance.midday_clock_in);
@@ -107,10 +110,10 @@ export const fieldService = {
     const lagos = getLagosTime(serverNow);
     const todayStr = lagos.dateStr;
 
-    const employee = await db.findById('employees', agentId);
+    const employee = await findEmployeeByAnyId(db, agentId);
     const isShiftEligible = employee ? isShiftEligibleRole(employee.role_code, employee.position) : true;
 
-    const existing = await db.findOne('attendance', { employee_id: Number(agentId), date: todayStr });
+    const existing = await db.findOne('attendance', { employee_id: toDbId(agentId), date: todayStr });
     const isAlreadyClockedIn = existing && 
       (existing.clock_in || existing.clock_in_time || existing.morning_clock_in || existing.midday_clock_in) && 
       !(existing.clock_out || existing.clock_out_time || existing.evening_clock_out);
@@ -141,8 +144,9 @@ export const fieldService = {
    * Smart Shift Window Enforcement, Duplicate Prevention, and Individual Geofence Validation.
    */
   async checkIn({ employeeId, storeId = null, locationId = null, latitude, longitude, accuracy = 5, address = null, device = 'Mobile Device', isOverride = false, overrideReason = null, req = null, testDate = null }) {
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error(`Employee #${employeeId} not found.`);
+    employeeId = employeeRef(employee);
 
     // 1. Authoritative Server Nigeria (Africa/Lagos) Time Calculation
     const serverNow = testDate ? new Date(testDate) : new Date();
@@ -169,7 +173,7 @@ export const fieldService = {
     }
 
     const companyId = employee.company_id || req?.user?.company_id || 1;
-    const existing = await db.findOne('attendance', { employee_id: Number(employeeId), date: todayStr });
+    const existing = await db.findOne('attendance', { employee_id: toDbId(employeeId), date: todayStr });
 
     // 3. Shift Window & Duplicate Validation for Eligible Roles (Sales / Field / Promoters)
     let windowInfo = null;
@@ -182,7 +186,7 @@ export const fieldService = {
       // Outside window -> Block and Audit
       if (!windowInfo.allowed && !isOverride) {
         await db.insert('location_logs', {
-          employee_id: Number(employeeId),
+          employee_id: toDbId(employeeId),
           employee_name: `${employee.first_name} ${employee.last_name}`,
           role: employee.role_code || (employee.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT'),
           company_id: Number(companyId),
@@ -234,12 +238,12 @@ export const fieldService = {
 
     // 4. Retrieve Active Permitted Locations & Geofence Validation
     let permittedLocations = await locationService.getActivePermittedLocations(employeeId, companyId);
-    const targetLocId = Number(storeId || locationId);
+    const targetLocId = toDbId(storeId || locationId);
     if (targetLocId) {
       const explicitLoc = await db.findById('work_locations', targetLocId) || await db.findById('stores', targetLocId);
       if (explicitLoc && Number(explicitLoc.company_id) === Number(companyId)) {
-        if (!permittedLocations.some(l => Number(l.id) === targetLocId)) {
-          permittedLocations.push(explicitLoc);
+        if (!permittedLocations.some(l => sameId(l.id, targetLocId))) {
+          permittedLocations.push({ ...explicitLoc, _is_store: Boolean(storeId) });
         }
       }
     }
@@ -247,11 +251,11 @@ export const fieldService = {
     if (permittedLocations.length === 0) {
       const allStores = await db.find('stores', { company_id: Number(companyId) });
       const matchingStores = allStores.filter(s => {
-        const fieldAssigned = Array.isArray(s.assigned_field_agents) && s.assigned_field_agents.includes(Number(employeeId));
-        const salesAssigned = Array.isArray(s.assigned_sales_agents) && s.assigned_sales_agents.includes(Number(employeeId));
+        const fieldAssigned = Array.isArray(s.assigned_field_agents) && s.assigned_field_agents.includes(toDbId(employeeId));
+        const salesAssigned = Array.isArray(s.assigned_sales_agents) && s.assigned_sales_agents.includes(toDbId(employeeId));
         return fieldAssigned || salesAssigned;
       });
-      permittedLocations.push(...matchingStores);
+      permittedLocations.push(...matchingStores.map(store => ({ ...store, _is_store: true })));
     }
 
     if (permittedLocations.length === 0 && !isOverride) {
@@ -281,7 +285,8 @@ export const fieldService = {
         radius,
         distance: distanceMeters,
         formattedDistance: formatDistance(distanceMeters),
-        isWithin
+        isWithin,
+        _is_store: Boolean(loc._is_store)
       });
 
       if (isWithin && (!matchedLocation || distanceMeters < shortestDistance)) {
@@ -297,13 +302,13 @@ export const fieldService = {
     if (!isWithin && !isOverride) {
       // Audit blocked geofence attempt
       await db.insert('location_logs', {
-        employee_id: Number(employeeId),
+        employee_id: toDbId(employeeId),
         employee_name: `${employee.first_name} ${employee.last_name}`,
         role: employee.role_code || (employee.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT'),
         company_id: Number(companyId),
         supervisor_id: employee.supervisor_id || null,
-        store_id: nearest?.id ? Number(nearest.id) : null,
-        location_id: nearest?.id ? Number(nearest.id) : null,
+        store_id: nearest?._is_store ? toDbId(nearest.id) : null,
+        location_id: nearest && !nearest._is_store ? toDbId(nearest.id) : null,
         timestamp: serverNow.toISOString(),
         server_timestamp: serverNow.toISOString(),
         local_time_lagos: lagos.isoLagos,
@@ -351,11 +356,11 @@ export const fieldService = {
     const status = isWithin ? (isLate ? 'Late' : 'Present') : (isOverride ? 'Present' : 'Outside Geofence');
 
     const attendanceData = {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       company_id: Number(companyId),
       supervisor_id: employee.supervisor_id || null,
-      store_id: targetLoc?.id ? Number(targetLoc.id) : null,
-      location_id: targetLoc?.id ? Number(targetLoc.id) : null,
+      store_id: targetLoc._is_store ? toDbId(targetLoc.id) : null,
+      location_id: targetLoc.id && !targetLoc._is_store ? toDbId(targetLoc.id) : null,
       location_name: targetLoc?.name || null,
       market: targetLoc?.name || null,
       assigned_market: targetLoc?.name || null,
@@ -424,13 +429,13 @@ export const fieldService = {
 
     // Insert into location_logs for Geo-Location Reporting and Complete Audit
     await db.insert('location_logs', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       employee_name: `${employee.first_name} ${employee.last_name}`,
       role: employee.role_code || (employee.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT'),
       company_id: Number(companyId),
       supervisor_id: employee.supervisor_id || null,
-      store_id: targetLoc?.id ? Number(targetLoc.id) : null,
-      location_id: targetLoc?.id ? Number(targetLoc.id) : null,
+      store_id: targetLoc._is_store ? toDbId(targetLoc.id) : null,
+      location_id: targetLoc.id && !targetLoc._is_store ? toDbId(targetLoc.id) : null,
       assigned_market: targetLoc?.name || 'Assigned Location',
       assigned_region: targetLoc?.region || employee.region || 'WEST',
       assigned_state: targetLoc?.state || employee.state || 'Lagos',
@@ -454,7 +459,7 @@ export const fieldService = {
 
     if (isLate) {
       await db.insert('location_alerts', {
-        employee_id: Number(employeeId),
+        employee_id: toDbId(employeeId),
         supervisor_id: employee.supervisor_id || null,
         company_id: Number(companyId),
         alert_type: 'LATE_CHECKIN',
@@ -467,7 +472,7 @@ export const fieldService = {
 
     if (!isWithin && isOverride) {
       await db.insert('location_alerts', {
-        employee_id: Number(employeeId),
+        employee_id: toDbId(employeeId),
         supervisor_id: employee.supervisor_id || null,
         company_id: Number(companyId),
         alert_type: 'OUTSIDE_GEOFENCE',
@@ -529,11 +534,12 @@ export const fieldService = {
     const lagos = getLagosTime(serverNow);
     const todayStr = lagos.dateStr;
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error(`Employee #${employeeId} not found.`);
+    employeeId = employeeRef(employee);
 
     const isShiftEligible = isShiftEligibleRole(employee.role_code, employee.position);
-    const existing = await db.findOne('attendance', { employee_id: Number(employeeId), date: todayStr });
+    const existing = await db.findOne('attendance', { employee_id: toDbId(employeeId), date: todayStr });
     const checkInTimestamp = existing?.clock_in || existing?.clock_in_time || existing?.morning_clock_in || existing?.midday_clock_in;
     if (!existing || !checkInTimestamp) {
       throw new Error('No active shift check-in found for today.');
@@ -571,13 +577,13 @@ export const fieldService = {
 
     // Final location log for checkout
     await db.insert('location_logs', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       employee_name: `${employee.first_name} ${employee.last_name}`,
       role: employee.role_code || (employee.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT'),
       company_id: Number(employee.company_id || 1),
       supervisor_id: employee.supervisor_id || null,
-      store_id: existing.store_id || existing.location_id || null,
-      location_id: existing.location_id || existing.store_id || null,
+      store_id: existing.store_id || null,
+      location_id: existing.location_id || null,
       timestamp: serverNow.toISOString(),
       server_timestamp: serverNow.toISOString(),
       local_time_lagos: lagos.isoLagos,
@@ -619,14 +625,14 @@ export const fieldService = {
    */
   async recordLocationPing({ employeeId, latitude, longitude, accuracy = 5, address = null, currentActivity = 'Field Patrol', batteryLevel = 80, req = null }) {
     const todayStr = new Date().toISOString().slice(0, 10);
-    const activeShift = await db.findOne('attendance', { employee_id: Number(employeeId), date: todayStr });
+    const activeShift = await db.findOne('attendance', { employee_id: toDbId(employeeId), date: todayStr });
 
     // Do NOT unnecessarily track outside working period
     if (!activeShift || !activeShift.clock_in_time || activeShift.clock_out_time) {
       return { status: 'IGNORED', message: 'Location tracking inactive outside approved work shift.' };
     }
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     let store = null;
     if (activeShift.store_id) {
       store = await db.findById('stores', activeShift.store_id);
@@ -642,7 +648,7 @@ export const fieldService = {
     }
 
     const log = await db.insert('location_logs', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       role: employee?.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT',
       company_id: employee?.company_id || 1,
       supervisor_id: employee?.supervisor_id || null,
@@ -662,7 +668,7 @@ export const fieldService = {
     // Alert supervisor if outside geofence during shift
     if (!isInside && distance > (store?.geofence_radius || 150) * 1.5) {
       await db.insert('location_alerts', {
-        employee_id: Number(employeeId),
+        employee_id: toDbId(employeeId),
         supervisor_id: employee?.supervisor_id || null,
         company_id: employee?.company_id || 1,
         alert_type: 'OUTSIDE_GEOFENCE',
@@ -681,7 +687,7 @@ export const fieldService = {
    */
   async getLocationHistory(employeeId, date = null) {
     const targetDate = (date || new Date().toISOString()).slice(0, 10);
-    const logs = await db.find('location_logs', { employee_id: Number(employeeId) }, { order: { column: 'timestamp', ascending: true } });
+    const logs = await db.find('location_logs', { employee_id: toDbId(employeeId) }, { order: { column: 'timestamp', ascending: true } });
     const stores = await db.find('stores');
 
     return logs
@@ -709,9 +715,9 @@ export const fieldService = {
       }
       return true;
     }).map(s => {
-      const supervisor = employees.find(e => Number(e.id) === Number(s.supervisor_id));
-      const fieldAgents = (s.assigned_field_agents || []).map(id => employees.find(e => Number(e.id) === Number(id))).filter(Boolean);
-      const salesAgents = (s.assigned_sales_agents || []).map(id => employees.find(e => Number(e.id) === Number(id))).filter(Boolean);
+      const supervisor = employees.find(e => matchesEmployee(e, s.supervisor_id));
+      const fieldAgents = (s.assigned_field_agents || []).map(id => employees.find(e => matchesEmployee(e, id))).filter(Boolean);
+      const salesAgents = (s.assigned_sales_agents || []).map(id => employees.find(e => matchesEmployee(e, id))).filter(Boolean);
 
       return {
         ...s,
@@ -735,7 +741,7 @@ export const fieldService = {
       throw new Error('Automatic device GPS capture is required for store registration.');
     }
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     const photoFile = files.store_photo ? files.store_photo[0] : null;
     const storefrontFile = files.storefront_photo ? files.storefront_photo[0] : null;
 
@@ -748,7 +754,7 @@ export const fieldService = {
       latitude: Number(latitude),
       longitude: Number(longitude),
       accuracy: Number(accuracy || 5),
-      requested_by: Number(employeeId),
+      requested_by: toDbId(employeeId),
       supervisor_id: employee?.supervisor_id || null,
       company_id: employee?.company_id || 1,
       store_photo_url: photoFile ? await storageService.uploadFile(photoFile, 'store_photos') : (data.store_photo_url || null),
@@ -780,13 +786,13 @@ export const fieldService = {
 
     return requests.filter(r => {
       if (filters.status && filters.status !== 'all' && r.status !== filters.status) return false;
-      if (filters.supervisor_id && Number(r.supervisor_id) !== Number(filters.supervisor_id)) return false;
-      if (filters.requested_by && Number(r.requested_by) !== Number(filters.requested_by)) return false;
+      if (filters.supervisor_id && !sameId(r.supervisor_id, filters.supervisor_id)) return false;
+      if (filters.requested_by && !sameId(r.requested_by, filters.requested_by)) return false;
       return true;
     }).map(r => ({
       ...r,
-      requester: employees.find(e => Number(e.id) === Number(r.requested_by)),
-      reviewer: r.reviewed_by ? employees.find(e => Number(e.id) === Number(r.reviewed_by)) : null
+      requester: employees.find(e => matchesEmployee(e, r.requested_by)),
+      reviewer: r.reviewed_by ? employees.find(e => matchesEmployee(e, r.reviewed_by)) : null
     }));
   },
 
@@ -843,7 +849,7 @@ export const fieldService = {
     // 3. Mark request as approved
     const updatedRequest = await db.update('store_requests', request.id, {
       status: 'approved',
-      reviewed_by: reviewerId ? Number(reviewerId) : null,
+      reviewed_by: reviewerId ? toDbId(reviewerId) : null,
       reviewed_at: new Date().toISOString()
     });
 
@@ -872,7 +878,7 @@ export const fieldService = {
     const updated = await db.update('store_requests', request.id, {
       status: 'rejected',
       rejection_reason: reason,
-      reviewed_by: reviewerId ? Number(reviewerId) : null,
+      reviewed_by: reviewerId ? toDbId(reviewerId) : null,
       reviewed_at: new Date().toISOString()
     });
 
@@ -904,7 +910,7 @@ export const fieldService = {
     const geofenceResult = verifyGeofence(agentLat, agentLng, storeLat, storeLng, radius);
 
     const visit = await db.insert('visits', {
-      agent_id: Number(agentId),
+      agent_id: toDbId(agentId),
       store_id: Number(store.id),
       customer_id: Number(store.id),
       status: 'in_progress',
@@ -941,11 +947,11 @@ export const fieldService = {
   async logFieldActivity(activityData, employeeId, file = null, req = null) {
     const { store_id, visit_id, activity_type, title, description, latitude, longitude, metadata } = activityData;
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     const photoUrl = file ? await storageService.uploadFile(file, 'activities') : (activityData.photo_url || null);
 
     const activity = await db.insert('field_activities', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       role: employee?.position?.includes('Sales') ? 'SALES_AGENT' : 'FIELD_AGENT',
       store_id: store_id ? Number(store_id) : null,
       visit_id: visit_id ? Number(visit_id) : null,
@@ -980,7 +986,7 @@ export const fieldService = {
     const photoUrl = file ? await storageService.uploadFile(file, 'sales_activities') : (activityData.photo_url || null);
 
     const activity = await db.insert('sales_activities', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       store_id: store_id ? Number(store_id) : null,
       customer_id: customer_id ? Number(customer_id) : null,
       visit_id: visit_id ? Number(visit_id) : null,
@@ -1099,9 +1105,9 @@ export const fieldService = {
    * Dispatches emergency SOS beacon with GPS coordinates.
    */
   async triggerSOS(agentId, latitude, longitude, accuracy = 5.0, message = 'Emergency SOS broadcast triggered', req = null) {
-    const agent = await db.findById('employees', agentId);
+    const agent = await findEmployeeByAnyId(db, agentId);
     const sosEvent = await db.insert('sos', {
-      agent_id: Number(agentId),
+      agent_id: toDbId(agentId),
       latitude: Number(latitude || 6.5244),
       longitude: Number(longitude || 3.3792),
       accuracy: Number(accuracy || 5.0),
@@ -1114,10 +1120,11 @@ export const fieldService = {
     const responders = managementUsers.filter(u => ['CEO', 'CTO', 'HR', 'SUPERVISOR', 'MANAGER'].includes(u.role_code));
 
     for (const resp of responders) {
-      const respEmp = await db.findOne('employees', { user_id: resp.id });
+      const respEmp = await db.findOne('employees', { user_id: resp.uuid || resp.auth_user_id || resp.id }) ||
+        await db.findOne('employees', { user_id: resp.id });
       if (respEmp) {
         await db.insert('notifications', {
-          employee_id: respEmp.id,
+          employee_id: employeeRef(respEmp),
           type: 'SOS',
           title: 'EMERGENCY SOS BEACON ACTIVE',
           body: `${agent ? `${agent.first_name} ${agent.last_name}` : 'Field Officer'} triggered emergency panic beacon. Immediate attention required!`,
@@ -1139,7 +1146,7 @@ export const fieldService = {
 
     return list.filter(s => !status || s.status === status).map(s => ({
       ...s,
-      agent: employees.find(e => Number(e.id) === Number(s.agent_id))
+      agent: employees.find(e => matchesEmployee(e, s.agent_id))
     }));
   },
 
@@ -1158,7 +1165,7 @@ export const fieldService = {
       const isFieldOrSales = ['Commercial Sales', 'Field Operations'].includes(e.department) ||
         ['SALES_AGENT', 'FIELD_AGENT'].includes(e.rank_code) ||
         (e.position && (e.position.includes('Sales') || e.position.includes('Field')));
-      const matchSupervisor = !supervisorId || Number(e.supervisor_id) === Number(supervisorId) || Number(e.id) === Number(supervisorId);
+      const matchSupervisor = !supervisorId || sameId(e.supervisor_id, supervisorId) || sameId(e.id, supervisorId) || sameId(e.uuid, supervisorId) || sameId(e.auth_user_id, supervisorId);
       return isFieldOrSales && matchSupervisor;
     });
 
@@ -1175,7 +1182,7 @@ export const fieldService = {
     let missingCheckoutCount = 0;
 
     for (const emp of teamEmployees) {
-      const att = todayAttendance.find(a => Number(a.employee_id) === Number(emp.id));
+      const att = todayAttendance.find(a => matchesEmployee(emp, a.employee_id));
       if (!att || !att.clock_in_time) {
         notCheckedInCount++;
       } else if (att.clock_out_time) {
@@ -1193,7 +1200,7 @@ export const fieldService = {
     const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     const yestAttendance = attendance.filter(a => String(a.date).slice(0, 10) === yesterdayStr);
     for (const emp of teamEmployees) {
-      const att = yestAttendance.find(a => Number(a.employee_id) === Number(emp.id));
+      const att = yestAttendance.find(a => matchesEmployee(emp, a.employee_id));
       if (att && att.clock_in_time && !att.clock_out_time) {
         missingCheckoutCount++;
       }
@@ -1240,7 +1247,7 @@ export const fieldService = {
         ['SALES_AGENT', 'FIELD_AGENT'].includes(e.rank_code) ||
         (e.position && (e.position.includes('Sales') || e.position.includes('Field')));
       if (!isFieldOrSales) return false;
-      if (filters.supervisor_id && Number(e.supervisor_id) !== Number(filters.supervisor_id)) return false;
+      if (filters.supervisor_id && !sameId(e.supervisor_id, filters.supervisor_id)) return false;
       if (filters.territory && e.territory !== filters.territory) return false;
       if (filters.role) {
         if (filters.role === 'FIELD_AGENT' && !e.position.includes('Field')) return false;
@@ -1255,12 +1262,12 @@ export const fieldService = {
     });
 
     return team.map(emp => {
-      const att = attendance.find(a => Number(a.employee_id) === Number(emp.id) && String(a.date).slice(0, 10) === todayStr);
+      const att = attendance.find(a => matchesEmployee(emp, a.employee_id) && String(a.date).slice(0, 10) === todayStr);
       const isSales = emp.position?.includes('Sales') || emp.department === 'Commercial Sales';
       const roleLabel = isSales ? 'Sales Agent' : 'Field Agent';
 
       // Find assigned work location or store (NO hardcoded universal fallback)
-      const empAssignments = assignments.filter(a => Number(a.employee_id) === Number(emp.id));
+      const empAssignments = assignments.filter(a => matchesEmployee(emp, a.employee_id));
       const primaryAssign = empAssignments.find(a => a.is_primary) || empAssignments[0];
 
       let assignedLoc = null;
@@ -1271,14 +1278,14 @@ export const fieldService = {
         assignedLoc = workLocations.find(l => Number(l.id) === Number(primaryAssign.location_id));
       } else {
         const matchingStore = stores.find(s =>
-          (Array.isArray(s.assigned_field_agents) && s.assigned_field_agents.includes(Number(emp.id))) ||
-          (Array.isArray(s.assigned_sales_agents) && s.assigned_sales_agents.includes(Number(emp.id)))
+          (Array.isArray(s.assigned_field_agents) && s.assigned_field_agents.some(id => matchesEmployee(emp, id))) ||
+          (Array.isArray(s.assigned_sales_agents) && s.assigned_sales_agents.some(id => matchesEmployee(emp, id)))
         );
         if (matchingStore) assignedLoc = matchingStore;
       }
 
       // Find latest location ping
-      const latestPing = locationLogs.find(l => Number(l.employee_id) === Number(emp.id));
+      const latestPing = locationLogs.find(l => matchesEmployee(emp, l.employee_id));
 
       // Calculate working duration
       let durationText = '—';
@@ -1319,11 +1326,11 @@ export const fieldService = {
       }
 
       // Compute agent sales today
-      const empOrders = orders.filter(o => Number(o.sales_agent_id) === Number(emp.id) && String(o.order_date).slice(0, 10) === todayStr);
+      const empOrders = orders.filter(o => matchesEmployee(emp, o.sales_agent_id) && String(o.order_date).slice(0, 10) === todayStr);
       const salesToday = empOrders.reduce((sum, o) => sum + Number(o.total_amount || 0), 0);
 
       // Compute store visits completed today
-      const empVisits = visits.filter(v => Number(v.agent_id) === Number(emp.id) && String(v.created_at).slice(0, 10) === todayStr);
+      const empVisits = visits.filter(v => matchesEmployee(emp, v.agent_id) && String(v.created_at).slice(0, 10) === todayStr);
       const visitsCompleted = empVisits.filter(v => v.status === 'completed').length;
 
       return {
@@ -1369,27 +1376,28 @@ export const fieldService = {
    */
   async getSupervisorEmployeeProfile(employeeId, date = null) {
     const todayStr = (date || new Date().toISOString()).slice(0, 10);
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error(`Employee #${employeeId} not found.`);
+    employeeId = employeeRef(employee);
 
-    const supervisor = employee.supervisor_id ? await db.findById('employees', employee.supervisor_id) : null;
-    const attendanceRecords = await db.find('attendance', { employee_id: Number(employeeId) });
+    const supervisor = employee.supervisor_id ? await findEmployeeByAnyId(db, employee.supervisor_id) : null;
+    const attendanceRecords = await db.find('attendance', { employee_id: toDbId(employeeId) });
     const todayAttendance = attendanceRecords.find(a => String(a.date).slice(0, 10) === todayStr);
 
     const empLocations = await locationService.getEmployeeLocations(employeeId, employee.company_id || 1);
     const primaryLocation = empLocations.primary_location || (empLocations.all_active_locations && empLocations.all_active_locations[0]) || null;
 
-    const locationLogs = await db.find('location_logs', { employee_id: Number(employeeId) }, { order: { column: 'timestamp', ascending: false } });
+    const locationLogs = await db.find('location_logs', { employee_id: toDbId(employeeId) }, { order: { column: 'timestamp', ascending: false } });
     const latestPing = locationLogs[0] || null;
 
     // Field activities & visits
-    const visits = await db.find('visits', { agent_id: Number(employeeId) });
+    const visits = await db.find('visits', { agent_id: toDbId(employeeId) });
     const todayVisits = visits.filter(v => String(v.created_at || v.planned_time).slice(0, 10) === todayStr);
-    const fieldActivities = await db.find('field_activities', { employee_id: Number(employeeId) });
-    const tasks = await db.find('tasks', { assigned_to: Number(employeeId) });
+    const fieldActivities = await db.find('field_activities', { employee_id: toDbId(employeeId) });
+    const tasks = await db.find('tasks', { assigned_to: toDbId(employeeId) });
 
     // Sales metrics for sales agents
-    const orders = await db.find('orders', { sales_agent_id: Number(employeeId) });
+    const orders = await db.find('orders', { sales_agent_id: toDbId(employeeId) });
     const todayOrders = orders.filter(o => String(o.order_date).slice(0, 10) === todayStr && o.status !== 'cancelled');
     const monthOrders = orders.filter(o => String(o.order_date).slice(0, 7) === todayStr.slice(0, 7) && o.status !== 'cancelled');
     const monthlySales = monthOrders.reduce((sum, o) => sum + Number(o.total_amount || 0), 0);
@@ -1457,7 +1465,7 @@ export const fieldService = {
     const events = [];
 
     // 1. Attendance Check-in / Check-out
-    const attendance = await db.find('attendance', { employee_id: Number(employeeId) });
+    const attendance = await db.find('attendance', { employee_id: toDbId(employeeId) });
     const todayAtt = attendance.find(a => String(a.date).slice(0, 10) === targetDate);
 
     if (todayAtt && todayAtt.clock_in_time) {
@@ -1472,7 +1480,7 @@ export const fieldService = {
     }
 
     // 2. Location Logs
-    const logs = await db.find('location_logs', { employee_id: Number(employeeId) });
+    const logs = await db.find('location_logs', { employee_id: toDbId(employeeId) });
     const todayLogs = logs.filter(l => String(l.timestamp).slice(0, 10) === targetDate && l.current_activity !== 'Shift Check-In');
     for (const log of todayLogs) {
       events.push({
@@ -1486,7 +1494,7 @@ export const fieldService = {
     }
 
     // 3. Store Visits
-    const visits = await db.find('visits', { agent_id: Number(employeeId) });
+    const visits = await db.find('visits', { agent_id: toDbId(employeeId) });
     const todayVisits = visits.filter(v => String(v.created_at || v.check_in_time).slice(0, 10) === targetDate);
     for (const v of todayVisits) {
       if (v.check_in_time) {
@@ -1512,7 +1520,7 @@ export const fieldService = {
     }
 
     // 4. Sales Orders
-    const orders = await db.find('orders', { sales_agent_id: Number(employeeId) });
+    const orders = await db.find('orders', { sales_agent_id: toDbId(employeeId) });
     const todayOrders = orders.filter(o => String(o.order_date || o.created_at).slice(0, 10) === targetDate);
     for (const o of todayOrders) {
       events.push({
@@ -1551,11 +1559,11 @@ export const fieldService = {
 
     return alerts.filter(a => {
       if (filters.status && filters.status !== 'all' && a.status !== filters.status) return false;
-      if (filters.supervisor_id && Number(a.supervisor_id) !== Number(filters.supervisor_id)) return false;
+      if (filters.supervisor_id && !sameId(a.supervisor_id, filters.supervisor_id)) return false;
       return true;
     }).map(a => ({
       ...a,
-      employee: employees.find(e => Number(e.id) === Number(a.employee_id))
+      employee: employees.find(e => matchesEmployee(e, a.employee_id))
     }));
   },
 
@@ -1568,7 +1576,7 @@ export const fieldService = {
 
     const updated = await db.update('location_alerts', alert.id, {
       status: 'resolved',
-      resolved_by: actorId ? Number(actorId) : null,
+      resolved_by: actorId ? toDbId(actorId) : null,
       resolved_at: new Date().toISOString(),
       resolution_notes: resolutionNotes
     });
@@ -1641,7 +1649,7 @@ export const fieldService = {
 
     const summaryData = {
       date: targetDate,
-      supervisor_id: supervisorId ? Number(supervisorId) : 9,
+      supervisor_id: supervisorId ? toDbId(supervisorId) : 9,
       company_id: 1,
       total_members: metrics.total_field_force,
       field_agents: metrics.total_field_agents,
@@ -1680,10 +1688,10 @@ export const fieldService = {
       return attendance.filter(a => {
         const d = String(a.date).slice(0, 10);
         if (d < start || d > end) return false;
-        if (employeeId && Number(a.employee_id) !== Number(employeeId)) return false;
+        if (employeeId && !sameId(a.employee_id, employeeId)) return false;
         return true;
       }).map(a => {
-        const emp = employees.find(e => Number(e.id) === Number(a.employee_id));
+        const emp = employees.find(e => matchesEmployee(e, a.employee_id));
         const store = stores.find(s => Number(s.id) === Number(a.store_id));
         return {
           id: a.id,
@@ -1709,10 +1717,10 @@ export const fieldService = {
       return logs.filter(l => {
         const d = String(l.timestamp).slice(0, 10);
         if (d < start || d > end) return false;
-        if (employeeId && Number(l.employee_id) !== Number(employeeId)) return false;
+        if (employeeId && !sameId(l.employee_id, employeeId)) return false;
         return true;
       }).map(l => {
-        const emp = employees.find(e => Number(e.id) === Number(l.employee_id));
+        const emp = employees.find(e => matchesEmployee(e, l.employee_id));
         const store = stores.find(s => Number(s.id) === Number(l.store_id));
         return {
           id: l.id,
@@ -1735,7 +1743,7 @@ export const fieldService = {
       const activities = await db.find('field_activities');
 
       return visits.map(v => {
-        const emp = employees.find(e => Number(e.id) === Number(v.agent_id));
+        const emp = employees.find(e => matchesEmployee(e, v.agent_id));
         const store = stores.find(s => Number(s.id) === Number(v.store_id || v.customer_id));
         return {
           id: v.id,
@@ -1757,7 +1765,7 @@ export const fieldService = {
       const customers = await db.find('customers');
 
       return orders.map(o => {
-        const agent = employees.find(e => Number(e.id) === Number(o.sales_agent_id));
+        const agent = employees.find(e => matchesEmployee(e, o.sales_agent_id));
         const customer = customers.find(c => Number(c.id) === Number(o.customer_id));
         return {
           order_number: o.order_number,
@@ -1785,7 +1793,7 @@ export const fieldService = {
     const stores = await db.find('stores', { company_id: Number(companyId) });
 
     let filtered = logs.map(log => {
-      const emp = employees.find(e => Number(e.id) === Number(log.employee_id));
+      const emp = employees.find(e => matchesEmployee(e, log.employee_id));
       const locId = Number(log.location_id || log.store_id);
       const matchedLoc = workLocations.find(w => Number(w.id) === locId) || stores.find(s => Number(s.id) === locId);
 
@@ -1862,7 +1870,7 @@ export const fieldService = {
       filtered = filtered.filter(r => r.date <= filters.end_date);
     }
     if (filters.employee_id) {
-      filtered = filtered.filter(r => Number(r.employee_id) === Number(filters.employee_id));
+      filtered = filtered.filter(r => sameId(r.employee_id, filters.employee_id));
     }
     if (filters.role) {
       filtered = filtered.filter(r => r.role === filters.role || r.designation.toLowerCase().includes(filters.role.toLowerCase()));
@@ -1896,5 +1904,3 @@ export const fieldService = {
     return filtered;
   }
 };
-
-

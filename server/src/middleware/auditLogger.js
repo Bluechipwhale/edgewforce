@@ -4,6 +4,7 @@
 
 import { db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
+import { userRef } from '../utils/id.js';
 
 /**
  * Creates an immutable audit trail record for significant business operations.
@@ -14,7 +15,7 @@ export async function recordAudit(actor, action, entity, entityId, metadata = {}
     const userAgent = req?.headers['user-agent'] || 'internal';
 
     const logEntry = {
-      actor_id: actor?.id || null,
+      actor_id: userRef(req?.user || actor) || null,
       actor_email: actor?.email || 'system',
       action,
       entity,

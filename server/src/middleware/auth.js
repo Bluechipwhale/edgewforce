@@ -5,6 +5,7 @@
 
 import jwt from 'jsonwebtoken';
 import { db, supabase } from '../config/database.js';
+import { isUuid, userRef } from '../utils/id.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || '3458929f44e69c199398c77212600d9f760aabb9b1dda42680556892307277ea';
 
@@ -43,16 +44,9 @@ export async function requireAuth(req, res, next) {
         authUserId = decoded.auth_user_id || decoded.uuid || decoded.userId || decoded.id || decoded.sub;
         authEmail = decoded.email?.toLowerCase();
       } catch {
-        // If JWT secret didn't match (e.g. standard Supabase token with unverified local secret), attempt safe decode
-        try {
-          const decoded = jwt.decode(token);
-          if (decoded && (decoded.sub || decoded.email)) {
-            authUserId = decoded.sub || decoded.userId || decoded.id;
-            authEmail = decoded.email?.toLowerCase();
-          }
-        } catch {
-          // Token invalid
-        }
+        return res.status(401).json({ success: false, error: {
+          code: 'INVALID_TOKEN', message: 'Invalid or expired authentication token.'
+        } });
       }
     }
 
@@ -65,16 +59,16 @@ export async function requireAuth(req, res, next) {
 
     // 3. Resolve Linked EdgeWForce Staff Profile
     if (authUserId) {
-      user = await db.findOne('users', { auth_user_id: authUserId }) ||
-             await db.findOne('users', { uuid: authUserId }) ||
+      user = (isUuid(String(authUserId)) ? await db.findOne('users', { auth_user_id: authUserId }) ||
+             await db.findOne('users', { uuid: authUserId }) : null) ||
              await db.findById('users', authUserId);
     }
 
     if (!user && authEmail) {
       user = await db.findOne('users', { email: authEmail });
       // If user matched by email and auth_user_id is not yet set, link it now!
-      if (user && authUserId && !user.auth_user_id) {
-        db.update('users', user.id, { auth_user_id: authUserId, uuid: authUserId }).catch(() => {});
+      if (user && isUuid(String(authUserId)) && !user.auth_user_id) {
+        db.update('users', user.id, { auth_user_id: authUserId }).catch(() => {});
       }
     }
 
@@ -104,7 +98,8 @@ export async function requireAuth(req, res, next) {
       });
     }
 
-    const employee = await db.findOne('employees', { user_id: user.id }) ||
+    const employee = await db.findOne('employees', { user_id: userRef(user) }) ||
+                     (userRef(user) !== user.id ? await db.findOne('employees', { user_id: user.id }) : null) ||
                      (user.auth_user_id ? await db.findOne('employees', { auth_user_id: user.auth_user_id }) : null);
     
     const [rank, department] = await Promise.all([

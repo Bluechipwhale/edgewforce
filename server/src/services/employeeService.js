@@ -8,6 +8,8 @@ import { calculateWorkingDays, calculatePayslipBreakdown } from '../utils/calcul
 import { recordAudit } from '../middleware/auditLogger.js';
 import { idleService } from './idleService.js';
 import { fieldService } from './fieldService.js';
+import { getLagosTime } from '../utils/nigeriaTime.js';
+import { employeeRef, findEmployeeByAnyId, sameId, toDbId, userRef } from '../utils/id.js';
 
 const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD || 0.80);
 
@@ -19,7 +21,8 @@ export const employeeService = {
   async getProfile(userId) {
     const user = await db.findById('users', userId);
     if (!user) throw new Error('User not found');
-    const employee = await db.findOne('employees', { user_id: user.id });
+    const employee = await db.findOne('employees', { user_id: userRef(user) }) ||
+      await db.findOne('employees', { user_id: user.id });
     if (!employee) throw new Error('Employee profile not found');
     const rank = employee.rank_code ? await db.findOne('ranks', { code: employee.rank_code }) : null;
     return {
@@ -34,16 +37,19 @@ export const employeeService = {
    * Retrieves summary data for employee home workspace.
    */
   async getDashboard(employeeId) {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = getLagosTime(new Date()).dateStr;
     const year = new Date().getFullYear();
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    const empId = employeeRef(employee);
 
-    const attendanceRecords = await db.find('attendance', { employee_id: Number(employeeId) });
+    const attendanceRecords = await db.find('attendance', { employee_id: empId });
     const todayAttendance = attendanceRecords.find(a => String(a.date).slice(0, 10) === todayStr);
 
-    let leaveBalance = await db.findOne('leave_balances', { employee_id: Number(employeeId), year });
+    let leaveBalance = await db.findOne('leave_balances', { employee_id: empId, year });
     if (!leaveBalance) {
       leaveBalance = await db.insert('leave_balances', {
-        employee_id: Number(employeeId),
+        employee_id: empId,
         year,
         annual: 20,
         sick: 12,
@@ -51,10 +57,10 @@ export const employeeService = {
       });
     }
 
-    const tasks = await db.find('tasks', { assigned_to: Number(employeeId) });
+    const tasks = await db.find('tasks', { assigned_to: empId });
     const activeTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'Cancelled');
 
-    const okrs = await db.find('okrs', { employee_id: Number(employeeId) });
+    const okrs = await db.find('okrs', { employee_id: empId });
     const announcements = await db.find('announcements', {}, { order: { column: 'created_at', ascending: false }, limit: 5 });
     const holidays = await db.find('holidays', {}, { order: { column: 'date', ascending: true }, limit: 5 });
 
@@ -90,7 +96,9 @@ export const employeeService = {
    * Retrieves employee timesheet records and working hours calculations.
    */
   async getAttendance(employeeId) {
-    const records = await db.find('attendance', { employee_id: Number(employeeId) }, { order: { column: 'date', ascending: false } });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    const records = await db.find('attendance', { employee_id: employeeRef(employee) }, { order: { column: 'date', ascending: false } });
 
     const totalHours = records.reduce((sum, r) => sum + Number(r.working_hours || 0), 0);
     const presentDays = records.filter(r => r.status === 'Present').length;
@@ -114,22 +122,23 @@ export const employeeService = {
    */
   async clockAttendance(employeeId, data, req = null) {
     const { latitude, longitude, accuracy, device, verification_mode, idempotency_key, address, isOverride, overrideReason } = data;
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = getLagosTime(new Date()).dateStr;
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error(`Employee #${employeeId} not found.`);
+    const empId = employeeRef(employee);
 
     if (idempotency_key) {
       const existing = await db.findOne('attendance', { idempotency_key });
       if (existing) return existing;
     }
 
-    const existing = await db.findOne('attendance', { employee_id: Number(employeeId), date: todayStr });
+    const existing = await db.findOne('attendance', { employee_id: empId, date: todayStr });
 
     if (!existing || !(existing.clock_in || existing.clock_in_time) || (existing.clock_out || existing.clock_out_time)) {
       // Perform strict check-in against employee's assigned locations
       return await fieldService.checkIn({
-        employeeId,
+        employeeId: empId,
         latitude,
         longitude,
         accuracy: accuracy || 5,
@@ -143,7 +152,7 @@ export const employeeService = {
 
     // Shift is currently open -> perform clock out
     return await fieldService.checkOut({
-      employeeId,
+      employeeId: empId,
       latitude,
       longitude,
       accuracy: accuracy || 5,
@@ -160,15 +169,16 @@ export const employeeService = {
   async verifyFaceBiometric(employeeId, data, req = null) {
     const { image_base64, event_type = 'VERIFICATION', simulated_confidence } = data;
 
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error('Employee not found');
+    const empId = employeeRef(employee);
 
     // Deterministic biometric score verification (configurable threshold)
     const confidence = simulated_confidence !== undefined ? Number(simulated_confidence) : 0.94;
     const isVerified = confidence >= FACE_MATCH_THRESHOLD;
 
     const faceEvent = await db.insert('face_events', {
-      employee_id: Number(employeeId),
+      employee_id: empId,
       event_type,
       confidence,
       match_threshold: FACE_MATCH_THRESHOLD,
@@ -180,7 +190,7 @@ export const employeeService = {
       await db.update('employees', employee.id, { face_enrolled: true });
     }
 
-    await recordAudit({ id: employeeId }, `FACE_${event_type}_${isVerified ? 'SUCCESS' : 'FAILED'}`, 'face_events', faceEvent.id, { confidence, threshold: FACE_MATCH_THRESHOLD }, req);
+    await recordAudit({ id: empId }, `FACE_${event_type}_${isVerified ? 'SUCCESS' : 'FAILED'}`, 'face_events', faceEvent.id, { confidence, threshold: FACE_MATCH_THRESHOLD }, req);
 
     return {
       verified: isVerified,
@@ -196,10 +206,13 @@ export const employeeService = {
    */
   async getLeaveBalances(employeeId) {
     const year = new Date().getFullYear();
-    let bal = await db.findOne('leave_balances', { employee_id: Number(employeeId), year });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    const empId = employeeRef(employee);
+    let bal = await db.findOne('leave_balances', { employee_id: empId, year });
     if (!bal) {
       bal = await db.insert('leave_balances', {
-        employee_id: Number(employeeId),
+        employee_id: empId,
         year,
         annual: 20,
         sick: 12,
@@ -233,7 +246,7 @@ export const employeeService = {
     }
 
     const request = await db.insert('leave_requests', {
-      employee_id: Number(employeeId),
+      employee_id: toDbId(employeeId),
       leave_type,
       start_date,
       end_date,
@@ -248,17 +261,20 @@ export const employeeService = {
   },
 
   async getLeaveRequests(employeeId) {
-    return await db.find('leave_requests', { employee_id: Number(employeeId) }, { order: { column: 'created_at', ascending: false } });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    return await db.find('leave_requests', { employee_id: employeeRef(employee) }, { order: { column: 'created_at', ascending: false } });
   },
 
   /**
    * Retrieves latest published payslip.
    */
   async getLatestPayslip(employeeId) {
-    const employee = await db.findById('employees', employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
     if (!employee) throw new Error('Employee not found');
+    const empId = employeeRef(employee);
 
-    const payslips = await db.find('payslips', { employee_id: Number(employeeId) }, { order: { column: 'pay_month', ascending: false } });
+    const payslips = await db.find('payslips', { employee_id: empId }, { order: { column: 'pay_month', ascending: false } });
     if (payslips.length) return payslips[0];
 
     // Fallback: Compute standard payslip from employee salary structure
@@ -270,7 +286,7 @@ export const employeeService = {
     );
 
     return {
-      employee_id: employee.id,
+      employee_id: empId,
       pay_month: new Date().toISOString().slice(0, 7) + '-01',
       ...breakdown,
       status: 'published'
@@ -278,17 +294,22 @@ export const employeeService = {
   },
 
   async getPayslips(employeeId) {
-    return await db.find('payslips', { employee_id: Number(employeeId) }, { order: { column: 'pay_month', ascending: false } });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    return await db.find('payslips', { employee_id: employeeRef(employee) }, { order: { column: 'pay_month', ascending: false } });
   },
 
   async getOKRs(employeeId) {
-    return await db.find('okrs', { employee_id: Number(employeeId) });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    return await db.find('okrs', { employee_id: employeeRef(employee) });
   },
 
   async updateOKR(okrId, employeeId, data) {
     const okr = await db.findById('okrs', okrId);
     if (!okr) throw new Error('OKR not found.');
-    if (Number(okr.employee_id) !== Number(employeeId)) {
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee || !sameId(okr.employee_id, employeeRef(employee))) {
       const err = new Error('Access denied. You can only update your own OKRs.');
       err.statusCode = 403;
       throw err;
@@ -304,7 +325,9 @@ export const employeeService = {
   },
 
   async getTasks(employeeId) {
-    return await db.find('tasks', { assigned_to: Number(employeeId) }, { order: { column: 'created_at', ascending: false } });
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    if (!employee) throw new Error('Employee profile not found.');
+    return await db.find('tasks', { assigned_to: employeeRef(employee) }, { order: { column: 'created_at', ascending: false } });
   },
 
   async updateTaskStatus(taskId, employeeId, data) {
@@ -312,7 +335,9 @@ export const employeeService = {
     if (!task) {
       throw new Error('Task not found.');
     }
-    const isOwner = Number(task.assigned_to) === Number(employeeId) || Number(task.employee_id) === Number(employeeId);
+    const employee = await findEmployeeByAnyId(db, employeeId);
+    const empId = employee ? employeeRef(employee) : toDbId(employeeId);
+    const isOwner = sameId(task.assigned_to, empId) || sameId(task.employee_id, empId);
     if (!isOwner) {
       const err = new Error('Access denied. You can only update your own assigned tasks.');
       err.statusCode = 403;
